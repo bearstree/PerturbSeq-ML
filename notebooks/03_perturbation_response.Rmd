@@ -1,0 +1,268 @@
+---
+title: "03 — K562 CRISPRi perturbation responses"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=6)
+set.seed(42)
+```
+
+# Audit and design
+
+The Part 1 12,000-cell subset retains perturbation diversity but has too few cells per target for detailed comparisons. This notebook loads that object, audits counts, then creates a separate seeded sample from the unchanged public raw H5AD. It uses the Part 1 QC thresholds and retains only targets with at least 100 post-QC sampled cells. The threshold is an exploratory minimum for stable summaries, not a substitute for biological replication.
+
+```{r packages}
+library(Seurat)
+library(anndataR)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+```
+
+```{r audit}
+part1 <- readRDS("data/processed/02_k562_clustered_seurat.rds")
+stopifnot("gene" %in% colnames(part1[[]]))
+part1_counts <- as.data.frame(table(as.character(part1$gene)))
+names(part1_counts) <- c("perturbation", "n_cells")
+part1_counts <- arrange(part1_counts, desc(n_cells))
+head(part1_counts, 15)
+cat("Target labels with at least 100 cells:", sum(part1_counts$n_cells >= 100 & part1_counts$perturbation != "non-targeting"), "\n")
+control_labels <- unique(as.character(part1$gene))[grepl("non.?target|negative.?control|^ntc$", unique(as.character(part1$gene)), ignore.case=TRUE)]
+print(control_labels)
+stopifnot(identical(control_labels, "non-targeting"))
+CONTROL_LABEL <- control_labels[[1]]
+rm(part1)
+gc()
+```
+
+### Interpretation
+
+The broad 12,000-cell subset has only about five cells per targeting label, and none meet the 100-cell threshold. Its breadth is useful for coverage but insufficient for detailed target-level comparisons. Metadata identifies one control label, `non-targeting`.
+
+# Supplemental sampling from the public raw H5AD
+
+The following Python chunk reads metadata from the raw file, selects the 12 most represented targeting labels, samples up to 250 cells per target and 500 controls with seed 42, and applies the Part 1 count, feature, and mitochondrial QC limits. It writes a sparse, modern H5AD without modifying the raw file. Selection by source abundance favors common perturbations; results do not represent all 2,058 targets.
+
+```{r python-config}
+reticulate::use_python("C:/Python314/python.exe", required=TRUE)
+```
+
+```{python supplemental-sample}
+import anndata as ad
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from pathlib import Path
+
+raw = ad.read_h5ad("data/raw/K562_essential_raw_singlecell_01.h5ad", backed="r")
+label_counts = raw.obs["gene"].value_counts()
+assert "non-targeting" in label_counts.index
+targets = label_counts.drop("non-targeting").head(12).index.tolist()
+rng = np.random.default_rng(42)
+chosen = []
+for label in ["non-targeting"] + targets:
+    positions = np.flatnonzero(raw.obs["gene"].to_numpy() == label)
+    chosen.extend(rng.choice(positions, min(len(positions), 500 if label == "non-targeting" else 250), replace=False))
+chosen = np.sort(np.asarray(chosen))
+matrix = np.asarray(raw.X[chosen, :])
+names = raw.var["gene_name"].astype(str).to_numpy()
+mt = np.char.startswith(names.astype(str), "MT-")
+n_count = matrix.sum(axis=1)
+n_feature = np.count_nonzero(matrix, axis=1)
+mt_percent = np.divide(100 * matrix[:, mt].sum(axis=1), n_count, out=np.zeros_like(n_count), where=n_count > 0)
+qc = pd.read_csv("results/01_qc_report.csv").iloc[0]
+keep = ((n_feature >= qc.feature_lower) & (n_feature <= qc.feature_upper) &
+        (n_count >= qc.count_lower) & (n_count <= qc.count_upper) &
+        (mt_percent <= qc.mt_max_percent))
+meta = raw.obs.iloc[chosen[keep]].copy()
+meta["nCount_RNA"] = n_count[keep]
+meta["nFeature_RNA"] = n_feature[keep]
+meta["percent.mt"] = mt_percent[keep]
+var = raw.var.copy()
+var["ensembl_id"] = var.index.astype(str)
+seen, symbols = {}, []
+for name in names:
+    count = seen.get(name, 0)
+    symbols.append(name if count == 0 else f"{name}_{count}")
+    seen[name] = count + 1
+var.index = symbols
+sample = ad.AnnData(X=sparse.csr_matrix(matrix[keep, :]), obs=meta, var=var)
+Path("data/processed").mkdir(exist_ok=True)
+sample.write_h5ad("data/processed/03_k562_powered_sample.h5ad", compression="gzip")
+pd.DataFrame({"target": targets, "source_cells": label_counts.loc[targets].to_numpy()}).to_csv("results/03_source_target_counts.csv", index=False)
+print("Sample shape:", sample.shape, "control:", (sample.obs.gene == "non-targeting").sum())
+print(sample.obs.gene.value_counts().to_string())
+raw.file.close()
+```
+
+```{r import-supplement}
+adata <- read_h5ad("data/processed/03_k562_powered_sample.h5ad")
+counts <- t(adata$X)
+rownames(counts) <- rownames(adata$var)
+colnames(counts) <- rownames(adata$obs)
+meta <- as.data.frame(adata$obs)
+rownames(meta) <- colnames(counts)
+obj <- CreateSeuratObject(counts=counts, meta.data=meta, project="K562_CRISPRi_Part2")
+MIN_CELLS <- 100L
+cell_counts <- as.data.frame(table(as.character(obj$gene)))
+names(cell_counts) <- c("perturbation", "n_cells")
+cell_counts <- arrange(cell_counts, desc(n_cells))
+eligible <- cell_counts |> filter(perturbation != CONTROL_LABEL, n_cells >= MIN_CELLS) |> pull(perturbation) |> as.character()
+stopifnot(length(eligible) >= 4, cell_counts$n_cells[cell_counts$perturbation == CONTROL_LABEL] >= MIN_CELLS)
+print(cell_counts)
+write.csv(cell_counts, "results/03_powered_cell_counts.csv", row.names=FALSE)
+```
+
+### Interpretation
+
+The focused cohort retains 12 targets with 245–249 cells each and 493 non-targeting controls after the Part 1 QC limits. This provides greater within-cohort descriptive precision, but the 12 targets were selected by source abundance and do not represent all 2,058 labels or biological replicates.
+
+# Direct target expression
+
+```{r knockdown}
+obj <- NormalizeData(obj, verbose=FALSE)
+norm <- GetAssayData(obj, assay="RNA", layer="data")
+kd <- lapply(eligible, function(target) {
+  target_cells <- which(obj$gene == target)
+  ctrl_cells <- which(obj$gene == CONTROL_LABEL)
+  if (!(target %in% rownames(obj))) return(data.frame(target=target, target_present=FALSE, n_target=length(target_cells), n_control=length(ctrl_cells), mean_target=NA_real_, mean_control=NA_real_, detection_target=NA_real_, detection_control=NA_real_, delta_mean_log=NA_real_))
+  target_values <- as.numeric(norm[target, target_cells])
+  ctrl_values <- as.numeric(norm[target, ctrl_cells])
+  a <- mean(target_values)
+  b <- mean(ctrl_values)
+  data.frame(target=target, target_present=TRUE, n_target=length(target_cells), n_control=length(ctrl_cells), mean_target=a, mean_control=b, detection_target=mean(target_values>0), detection_control=mean(ctrl_values>0), delta_mean_log=a-b)
+}) |> bind_rows() |> arrange(delta_mean_log)
+print(kd)
+write.csv(kd, "results/03_target_knockdown.csv", row.names=FALSE)
+ggplot(kd, aes(x=reorder(target, delta_mean_log), y=delta_mean_log)) + geom_col() + coord_flip() +
+  geom_hline(yintercept=0, linetype=2) + labs(x="Target", y="Difference in mean log-normalized expression") + theme_minimal()
+```
+
+### Key finding
+
+RPL3 has the largest negative mean log-normalized target-expression difference (−0.438) among the 12 tested targets. Negative differences are consistent with target transcript reduction; detection fractions show when low expression limits interpretation. These cell-level summaries do not measure editing efficiency or provide biological-replicate evidence.
+
+# Exploratory cell-level DE
+
+Cell-level Wilcoxon tests compare cells within this public experiment. Cells are not independent biological replicates; adjusted p-values are exploratory and do not support replicate-aware inference.
+
+```{r de}
+Idents(obj) <- "gene"
+representative <- head(eligible, 4)
+de_tables <- lapply(representative, function(target) {
+  FindMarkers(obj, ident.1=target, ident.2=CONTROL_LABEL, test.use="wilcox", logfc.threshold=0, min.pct=0) |>
+    rownames_to_column("gene") |>
+    mutate(perturbation=target, significant=p_val_adj < 0.05 & abs(avg_log2FC) >= 0.5)
+})
+de <- bind_rows(de_tables)
+de_summary <- de |> group_by(perturbation) |>
+  summarise(n_tested=n(), n_exploratory_hits=sum(significant, na.rm=TRUE), .groups="drop")
+print(de_summary)
+print(de |> group_by(perturbation) |> slice_min(p_val_adj, n=5, with_ties=FALSE))
+write.csv(de, "results/03_representative_cell_level_DE.csv", row.names=FALSE)
+write.csv(de_summary, "results/03_DE_summary.csv", row.names=FALSE)
+```
+
+### Interpretation
+
+Exploratory cell-level differential expression identifies 94 DONSON hits and 2 BUB1 hits at the stated adjusted-p-value and effect-size cutoffs. The larger DONSON count may reflect a broader response, but hit counts also depend on effect size, dispersion, expression, and power. Cells are not independent biological replicates, so these are not replicate-aware significance claims.
+
+```{r volcano}
+ggplot(de, aes(avg_log2FC, -log10(pmax(p_val_adj, 1e-300)))) +
+  geom_point(aes(color=significant), size=0.5, alpha=0.6) +
+  facet_wrap(~perturbation) + geom_vline(xintercept=c(-0.5, 0.5), linetype=2) +
+  geom_hline(yintercept=-log10(0.05), linetype=2) +
+  labs(x="Average log2 fold change", y="-log10 adjusted p-value", color="Exploratory hit") + theme_minimal()
+```
+
+### Interpretation
+
+The volcano panels show direction, effect size, and exploratory cell-level statistical ranking for four selected perturbations. DONSON has more genes beyond both plotted cutoffs than BUB1, KIF11, or NUP205. The panels do not establish a mechanism.
+
+# Aggregate profiles and perturbation-level effects
+
+The following sums raw counts across cells by label. Each label has one aggregate, so these are descriptive pseudobulk summaries without replicate-level variance estimates. Effect vectors are log2 CPM differences from the non-targeting aggregate.
+
+```{r aggregate}
+raw_counts <- GetAssayData(obj, assay="RNA", layer="counts")
+groups <- c(CONTROL_LABEL, eligible)
+pseudobulk <- sapply(groups, function(label) Matrix::rowSums(raw_counts[, obj$gene == label, drop=FALSE]))
+colnames(pseudobulk) <- groups
+cpm <- sweep(pseudobulk, 2, colSums(pseudobulk), "/") * 1e6
+log_cpm <- log2(cpm + 1)
+delta_all <- sweep(log_cpm[, eligible, drop=FALSE], 1, log_cpm[, CONTROL_LABEL], "-")
+obj <- FindVariableFeatures(obj, nfeatures=2000, verbose=FALSE)
+effect_genes <- intersect(VariableFeatures(obj), rownames(delta_all))
+delta <- delta_all[effect_genes, , drop=FALSE]
+magnitude <- data.frame(perturbation=colnames(delta), l2_effect=sqrt(colSums(delta^2))) |> arrange(desc(l2_effect))
+print(magnitude)
+saveRDS(pseudobulk, "data/processed/03_pseudobulk_raw_counts.rds")
+saveRDS(delta, "data/processed/03_perturbation_effect_matrix.rds")
+write.csv(magnitude, "results/03_perturbation_magnitude.csv", row.names=FALSE)
+```
+
+### Interpretation
+
+The raw-count sums form one aggregate perturbation expression profile per label, without replicate-level variance estimates. Log2 CPM differences from the shared non-targeting aggregate create perturbation-level effect vectors across 2,000 variable genes. Their L2 norms summarize response magnitude and can also reflect composition or technical differences.
+
+```{r magnitude-plot}
+ggplot(magnitude, aes(reorder(perturbation, l2_effect), l2_effect)) + geom_col() + coord_flip() +
+  labs(x="Perturbation", y="L2 norm of log2 CPM effect vector") + theme_minimal()
+```
+
+### Key finding
+
+GAB2 has the largest aggregate effect-vector norm (24.474) among the 12 analyzed targets. This is a descriptive measure of deviation from control across the selected genes, not a replicate-aware test. The ranking does not generalize to all targets in the source dataset.
+
+# Distributional distance
+
+`scperturbR` E-distance compares cell distributions in a 30-component PCA space. E-test permutes cell labels within the same experiment (199 permutations). Its p-values are exploratory because cells are not biological replicates.
+
+```{r scperturbR}
+stopifnot(requireNamespace("scperturbR", quietly=TRUE))
+obj <- ScaleData(obj, features=VariableFeatures(obj), verbose=FALSE)
+obj <- RunPCA(obj, features=VariableFeatures(obj), npcs=30, verbose=FALSE)
+e_matrix <- scperturbR::edist(obj, groupby="gene", reduction="pca", sample_correction=TRUE, verbose=FALSE)
+e_control <- data.frame(perturbation=eligible,
+                        e_distance_to_control=as.numeric(e_matrix[eligible, CONTROL_LABEL])) |>
+  arrange(desc(e_distance_to_control))
+print(e_control)
+e_test <- scperturbR::etest(obj, groupby="gene", control=CONTROL_LABEL,
+                           reduction="pca", permutations=199, verbose=FALSE)
+e_test <- e_test[eligible, , drop=FALSE] |>
+  rownames_to_column("perturbation") |>
+  arrange(pval)
+print(e_test)
+write.csv(e_matrix, "results/03_scperturbR_E_distance_matrix.csv")
+write.csv(e_control, "results/03_scperturbR_E_distance_to_control.csv", row.names=FALSE)
+write.csv(e_test, "results/03_scperturbR_E_test.csv", row.names=FALSE)
+```
+
+### Key finding
+
+GAB2 has the largest E-distance from non-targeting cells (6.484), indicating the greatest multivariate separation in the 30-component PCA representation among these targets. E-tests used 199 cell-label permutations. Their p-values remain exploratory and do not provide biological-replicate-aware inference or establish a causal mechanism.
+
+```{r save}
+saveRDS(obj, "data/processed/03_k562_perturbation_ready.rds")
+```
+
+## Key results
+
+```{r key-results}
+cat("Eligible targets:", length(eligible), "control cells:", cell_counts$n_cells[cell_counts$perturbation == CONTROL_LABEL], "\n")
+cat("Largest negative target-expression difference:", kd$target[1], round(kd$delta_mean_log[1], 3), "\n")
+cat("Largest aggregate response:", magnitude$perturbation[1], round(magnitude$l2_effect[1], 3), "\n")
+cat("Largest E-distance to control:", e_control$perturbation[1], round(e_control$e_distance_to_control[1], 3), "\n")
+print(de_summary)
+```
+
+- **Focused cohort:** 12 targets with 245–249 cells each and 493 controls support detailed exploratory comparisons.
+- **Target expression:** RPL3 has the largest negative mean log-normalized difference (−0.438), consistent with reduced target transcript abundance.
+- **Cell-level DE:** DONSON has 94 exploratory hits and BUB1 has 2; these are not replicate-aware findings.
+- **Aggregate response:** GAB2 has the largest effect-vector norm (24.474) across 2,000 variable genes.
+- **Distributional response:** GAB2 has the largest E-distance from control (6.484); the 199-permutation E-tests remain exploratory.

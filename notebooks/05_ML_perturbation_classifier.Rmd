@@ -1,0 +1,145 @@
+---
+title: "05 — Classification of known K562 perturbation classes"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=7)
+set.seed(42)
+```
+
+# Cohort and evaluation scope
+
+This classifier uses the focused Part 2 cohort, not the broad 12,000-cell coverage subset. The non-targeting control is included as a meaningful reference class. Random held-out cells test generalization to new cells from **known perturbation classes**, not unseen targets. Guide identities may occur in both splits, so this is not guide-wise generalization.
+
+```{r cohort}
+library(Seurat)
+library(ggplot2)
+obj <- readRDS("data/processed/03_k562_perturbation_ready.rds")
+stopifnot("gene" %in% colnames(obj[[]]), "sgID_AB" %in% colnames(obj[[]]))
+class_counts <- as.data.frame(table(as.character(obj$gene)))
+names(class_counts) <- c("class", "n_cells")
+class_counts <- class_counts[order(-class_counts$n_cells), ]
+stopifnot(nrow(class_counts)==13, min(class_counts$n_cells)>=100)
+guide_counts <- aggregate(sgID_AB ~ gene, data=obj[[]], FUN=function(x) length(unique(as.character(x))))
+names(guide_counts) <- c("class", "n_distinct_guide_pairs")
+class_counts <- merge(class_counts, guide_counts, by="class", sort=FALSE)
+class_counts <- class_counts[order(-class_counts$n_cells), ]
+print(class_counts, row.names=FALSE)
+write.csv(class_counts, "results/05_class_counts.csv", row.names=FALSE)
+cat("Total cells:", ncol(obj), "classes:", nrow(class_counts), "\n")
+rm(obj)
+gc()
+```
+
+### Interpretation
+
+The model includes 12 targeting labels with 245–249 cells each and 493 non-targeting cells, all above the 100-cell minimum. The control class is roughly twice the size of a target class. Most targets have one observed guide pair, and this random cell split does not test guide-wise generalization.
+
+# Fixed stratified split and model
+
+The matching Part 2 H5AD supplies the sparse raw-count matrix. Class selection is verified against the saved Seurat cohort. A fixed 80/20 stratified split (seed 42) is made before fitting the 30-component TruncatedSVD and multinomial elastic-net logistic model. Per-cell total-count normalization and log1p transform are deterministic; SVD and logistic coefficients are fitted on training cells only. All genes enter training-only SVD, so there is no feature ranking learned from test cells. TruncatedSVD is not centered PCA.
+
+```{r python-config}
+reticulate::use_python("C:/Python314/python.exe", required=TRUE)
+```
+
+```{python train-model}
+import anndata as ad
+import joblib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import normalize
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+
+adata = ad.read_h5ad("data/processed/03_k562_powered_sample.h5ad")
+expected = pd.read_csv("results/05_class_counts.csv")
+actual = adata.obs.gene.astype(str).value_counts()
+assert adata.n_obs == expected.n_cells.sum() == 3458
+assert actual.to_dict() == dict(zip(expected["class"], expected.n_cells))
+assert np.isfinite(adata.X.data).all() and np.all(adata.X.data >= 0)
+assert np.all(adata.X.data == np.floor(adata.X.data)), "X must contain integer raw counts"
+X = adata.X.tocsr()
+y = adata.obs.gene.astype(str).to_numpy()
+train_idx, test_idx = train_test_split(np.arange(len(y)), test_size=0.2, random_state=42, stratify=y)
+
+def log_normalize(M):
+    result = normalize(M, norm="l1", axis=1).tocsr() * 10000
+    result.data = np.log1p(result.data)
+    return result
+
+X_train = log_normalize(X[train_idx])
+X_test = log_normalize(X[test_idx])
+svd = TruncatedSVD(n_components=30, random_state=42)
+Z_train = svd.fit_transform(X_train)
+Z_test = svd.transform(X_test)
+model = LogisticRegression(penalty="elasticnet", solver="saga", l1_ratio=0.5,
+                           C=1.0, max_iter=2000, random_state=42)
+model.fit(Z_train, y[train_idx])
+pred = model.predict(Z_test)
+labels = sorted(np.unique(y))
+majority = pd.Series(y[train_idx]).value_counts().idxmax()
+baseline = float(np.mean(y[test_idx] == majority))
+metrics = pd.DataFrame({"metric": ["accuracy", "macro_f1", "majority_baseline_accuracy", "train_cells", "test_cells", "classes"],
+                        "value": [accuracy_score(y[test_idx], pred), f1_score(y[test_idx], pred, average="macro", labels=labels), baseline, len(train_idx), len(test_idx), len(labels)]})
+report = pd.DataFrame(classification_report(y[test_idx], pred, labels=labels, output_dict=True, zero_division=0)).T
+report = report.loc[labels].reset_index(names="class")
+cm = pd.DataFrame(confusion_matrix(y[test_idx], pred, labels=labels), index=labels, columns=labels)
+pd.DataFrame({"cell": adata.obs_names[test_idx], "truth": y[test_idx], "prediction": pred}).to_csv("results/05_test_predictions.csv", index=False)
+pd.DataFrame({"class": labels, "train_cells": pd.Series(y[train_idx]).value_counts().reindex(labels).values,
+              "test_cells": pd.Series(y[test_idx]).value_counts().reindex(labels).values}).to_csv("results/05_split_counts.csv", index=False)
+metrics.to_csv("results/05_ml_metrics.csv", index=False)
+report.to_csv("results/05_per_class_metrics.csv", index=False)
+cm.rename_axis("truth").reset_index().to_csv("results/05_confusion_matrix.csv", index=False)
+Path("models").mkdir(exist_ok=True)
+joblib.dump({"svd": svd, "classifier": model, "genes": adata.var_names.tolist(),
+             "normalization": "per-cell total 10000, log1p", "classes": labels,
+             "seed": 42, "test_fraction": 0.2}, "models/05_multinomial_elastic_net.joblib")
+print(metrics.to_string(index=False))
+print(pd.read_csv("results/05_split_counts.csv").to_string(index=False))
+print("SVD variance fraction:", round(float(svd.explained_variance_ratio_.sum()), 3))
+```
+
+### Key finding
+
+On 692 held-out cells from the 13 known classes, accuracy is 0.410 versus a 0.143 majority-class baseline (about 2.9-fold higher). This moderate performance indicates perturbation-associated signal beyond class prevalence, while macro-F1 of 0.386 shows uneven class discrimination. The fixed split fits SVD and elastic-net coefficients on 2,766 training cells; no cross-validation or guide-wise split was performed.
+
+# Confusion matrix and per-class performance
+
+```{r results}
+metrics <- read.csv("results/05_ml_metrics.csv")
+per_class <- read.csv("results/05_per_class_metrics.csv")
+cm <- read.csv("results/05_confusion_matrix.csv", check.names=FALSE)
+print(metrics)
+print(per_class[, c("class", "precision", "recall", "f1.score", "support")])
+conf_matrix <- as.matrix(cm[, -1, drop=FALSE])
+rownames(conf_matrix) <- cm$truth
+conf_long <- as.data.frame(as.table(conf_matrix))
+names(conf_long) <- c("truth", "prediction", "n")
+ggplot(conf_long, aes(prediction, truth, fill=n)) + geom_tile() + geom_text(aes(label=n), size=2.5) +
+  labs(x="Predicted class", y="True class", fill="Cells") +
+  theme_minimal() + theme(axis.text.x=element_text(angle=60, hjust=1))
+```
+
+### Interpretation
+
+Per-class F1 ranges from 0 for BUB1 to 0.857 for NCBP2. The confusion matrix shows frequent predictions of non-targeting for NUP205 (38 of 50 test cells), KIF11 (36 of 50), and BUB1 (35 of 50). These errors indicate substantial overlap among the measured cell states; the evaluation does not address unseen perturbation targets.
+
+## Key results
+
+```{r key-results}
+cat("Classes:", metrics$value[metrics$metric=="classes"], "train/test cells:", metrics$value[metrics$metric=="train_cells"], "/", metrics$value[metrics$metric=="test_cells"], "\n")
+cat("Accuracy:", round(metrics$value[metrics$metric=="accuracy"], 3), "macro-F1:", round(metrics$value[metrics$metric=="macro_f1"], 3), "majority baseline:", round(metrics$value[metrics$metric=="majority_baseline_accuracy"], 3), "\n")
+```
+
+- **Evaluation cohort:** 13 known classes contribute 2,766 training and 692 test cells in a fixed stratified split.
+- **Performance:** accuracy is 0.410 versus a 0.143 majority baseline, indicating moderate perturbation-associated signal.
+- **Class balance:** macro-F1 is 0.386; frequent control predictions limit discrimination for several targets.
+- **Scope:** held-out cells test known classes, not unseen targets or guide-wise generalization.

@@ -1,0 +1,27 @@
+# Public data and large intermediate objects
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+artifacts/*.h5ad
+
+# R and Python temporary files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj.user/
+**/*_cache/
+**/*_files/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+*.knit.md
+*.utf8.md
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak

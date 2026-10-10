@@ -1,0 +1,91 @@
+---
+title: "01 — K562 Perturb-seq import and QC"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=5)
+set.seed(42)
+```
+
+# Data and conversion
+
+The source is the public Replogle et al. K562 essential-gene CRISPRi H5AD (`10.25452/figshare.plus.20029387`). Its legacy AnnData encoding is converted without changing the raw file. From the project root, run `python scripts/prepare_k562_subset.py` to calculate full-dataset QC and write a sparse, modern H5AD. The seeded analysis sample retains at least five cells per perturbation when available, then samples the remaining cells at random to 12,000 cells.
+
+```{r packages}
+library(anndataR)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+```
+
+```{r import}
+path <- "data/processed/01_k562_analysis.h5ad"
+stopifnot(file.exists(path))
+adata <- read_h5ad(path)
+cat("Analysis dimensions (cells x genes):", paste(dim(adata), collapse=" x "), "\n")
+cat("obs columns:", paste(colnames(adata$obs), collapse=", "), "\n")
+cat("var columns:", paste(colnames(adata$var), collapse=", "), "\n")
+stopifnot("gene" %in% colnames(adata$obs))
+```
+
+```{r seurat}
+counts <- t(adata$X)
+stopifnot(inherits(counts, "sparseMatrix"))
+rownames(counts) <- rownames(adata$var)
+colnames(counts) <- rownames(adata$obs)
+meta <- as.data.frame(adata$obs)
+rownames(meta) <- colnames(counts)
+obj <- CreateSeuratObject(counts=counts, meta.data=meta, project="Replogle_K562_CRISPRi")
+cat("Sparse matrix:", class(counts)[1], "nonzero entries:", length(counts@x), "\n")
+summary(obj$nCount_RNA)
+summary(obj$nFeature_RNA)
+```
+
+### Interpretation
+
+The source contains 310,385 cells and 8,563 genes. Count and detected-feature summaries are derived from the sparse expression matrix, which retains zero values without a dense allocation. These measures provide the basis for the recorded QC limits.
+
+# QC and perturbation coverage
+
+```{r qc}
+qc <- read.csv("results/01_qc_report.csv")
+qc
+cat("Mitochondrial genes:", qc$mt_gene_count, "\n")
+if (qc$mt_gene_count > 0) print(summary(obj$percent.mt))
+VlnPlot(obj, features=c("nCount_RNA", "nFeature_RNA"), pt.size=0)
+```
+
+### Interpretation
+
+QC retained 305,906 of 310,385 cells (98.6%), indicating modest rather than aggressive removal. Count and feature limits use the full-dataset 0.5% and 99.5% quantiles; 13 observed mitochondrial genes support the 20% mitochondrial ceiling. The violin plots describe the retained sample's QC distributions and do not independently establish biological quality.
+
+```{r perturbation-coverage}
+full_counts <- read.csv("results/01_perturbation_cell_counts.csv")
+sample_counts <- read.csv("results/01_analysis_perturbation_counts.csv")
+cat("Perturbations after QC:", nrow(full_counts), "\n")
+cat("Perturbations in analysis:", nrow(sample_counts), "\n")
+summary(sample_counts$n_cells)
+ggplot(head(sample_counts, 25), aes(x=reorder(gene, n_cells), y=n_cells)) +
+  geom_col() + coord_flip() + labs(x="Perturbation", y="Analysis cells") + theme_minimal()
+```
+
+### Interpretation
+
+The seeded 12,000-cell subset retains all 2,058 post-QC perturbation labels, making it useful for broad coverage and global structure. Its median is five cells per label; the frequency plot highlights uneven representation, including 76 non-targeting cells. This subset is too sparse for reliable detailed differential expression across all targets.
+
+```{r save}
+saveRDS(obj, "data/processed/01_k562_qc_seurat.rds")
+```
+
+## Key results
+
+```{r key-results}
+cat("Full cells:", qc$before, "after QC:", qc$after, "analysis cells:", qc$analysis, "\n")
+cat("Genes:", nrow(obj), "perturbations:", nrow(sample_counts), "\n")
+```
+
+- **Source data:** 310,385 cells × 8,563 genes provide the full public input.
+- **QC-filtered data:** 305,906 cells (98.6%) remain after the recorded count, feature, and mitochondrial limits.
+- **Broad coverage subset:** 12,000 seeded cells retain all 2,058 labels for global analysis, with limited per-target power.

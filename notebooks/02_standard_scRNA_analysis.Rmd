@@ -1,0 +1,179 @@
+---
+title: "02 — Single-Cell Transcriptomics: Normalization, PCA, Clustering, and Cell States"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, fig.width=10, fig.height=7)
+set.seed(42)
+```
+
+# Goal
+
+This notebook performs the core single-cell transcriptomics workflow: normalization, highly variable gene selection, PCA, graph construction, clustering, UMAP, and cell-state characterization.
+
+Normalize expression, select highly variable genes, run PCA, graph clustering and UMAP, and characterize **K562 cell states**.
+
+K562 is a cell line, so this notebook deliberately avoids pretending that clusters are PBMC-like immune cell types.
+
+```{r packages}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+obj <- readRDS("data/processed/01_k562_qc_seurat.rds")
+```
+
+# Detect perturbation field
+
+```{r field}
+pick_first <- function(x,a) { h<-x[x%in%a]; if(length(h)==0) NA_character_ else h[[1]] }
+perturbation_col <- pick_first(
+ c("gene","perturbation","gene_transcript","target_gene","condition"),
+ colnames(obj[[]])
+)
+if (is.na(perturbation_col)) stop("Set perturbation_col manually.")
+```
+
+# Normalize and select HVGs
+
+```{r normalize}
+obj <- NormalizeData(obj, scale.factor=10000, verbose=FALSE)
+obj <- FindVariableFeatures(obj, selection.method="vst", nfeatures=3000, verbose=FALSE)
+
+top_hvg <- head(VariableFeatures(obj),20)
+top_hvg
+
+p <- VariableFeaturePlot(obj)
+LabelPoints(p, points=head(top_hvg,10), repel=TRUE)
+```
+
+### Interpretation
+
+The 3,000 selected highly variable genes define the expression features used for PCA and neighborhood analysis. Their variability summarizes heterogeneity in this K562 sample; ranking alone does not identify causal perturbation responses.
+
+# Scale and PCA
+
+```{r pca}
+obj <- ScaleData(obj, features=VariableFeatures(obj), verbose=FALSE)
+obj <- RunPCA(obj, features=VariableFeatures(obj), npcs=50, verbose=FALSE)
+
+ElbowPlot(obj, ndims=50)
+VizDimLoadings(obj, dims=1:4, reduction="pca", nfeatures=20)
+```
+
+### Interpretation
+
+The elbow plot shows a gradual decline in variance contribution, without a sharp boundary that would establish an exact optimal PC count. The first 30 components provide a fixed representation for the graph and UMAP; this choice is an analysis setting rather than a biological threshold.
+
+# Neighbor graph, clustering and UMAP
+
+```{r umap}
+dims_use <- 1:30
+obj <- FindNeighbors(obj, dims=dims_use, verbose=FALSE)
+obj <- FindClusters(obj, resolution=0.5, random.seed=42, verbose=FALSE)
+obj <- RunUMAP(obj, dims=dims_use, seed.use=42, verbose=FALSE)
+
+DimPlot(obj,reduction="umap",label=TRUE,repel=TRUE) +
+ ggtitle("K562 transcriptional-state clusters")
+```
+
+### Interpretation
+
+Graph analysis identifies 10 transcriptional-state clusters within the 12,000 analyzed K562 cells. UMAP displays their organization in two dimensions, but visual separation does not establish distinct cell types in a single cell line. Cell cycle, perturbation response, and technical variation may all contribute.
+
+# Technical overlays
+
+```{r technical}
+FeaturePlot(obj,features=c("nCount_RNA","nFeature_RNA"),ncol=2)
+```
+
+### Interpretation
+
+Count depth and detected-feature overlays show related gradients across UMAP, including higher values toward the left and lower values in parts of the right side. These technical measures covary with the embedding, so some structure may reflect library complexity. The plots do not establish that technical variation alone determines the clusters.
+
+# Selected perturbations on UMAP
+
+```{r perturbations}
+freq <- obj[[]] |>
+ count(.data[[perturbation_col]],name="n") |>
+ arrange(desc(n))
+
+top_targets <- head(freq[[perturbation_col]],12)
+
+obj$perturbation_display <- ifelse(
+ obj[[]][[perturbation_col]] %in% top_targets,
+ as.character(obj[[]][[perturbation_col]]),
+ "Other"
+)
+
+DimPlot(obj,reduction="umap",group.by="perturbation_display",shuffle=TRUE) +
+ ggtitle("Selected perturbations across cell-state space")
+```
+
+### Interpretation
+
+The selected labels can be located within the K562 state map, but the broad coverage subset has few cells per targeting label. Apparent spatial differences are descriptive and motivate the focused perturbation comparisons in Notebook 03.
+
+# Cluster marker discovery
+
+```{r markers}
+Idents(obj) <- "seurat_clusters"
+cluster_markers <- FindAllMarkers(
+ obj,
+ only.pos=TRUE,
+ min.pct=0.10,
+ logfc.threshold=0.25
+)
+
+cluster_markers |>
+ group_by(cluster) |>
+ slice_max(avg_log2FC,n=10,with_ties=FALSE)
+```
+
+### Interpretation
+
+Marker testing yields 10,022 positive cluster-marker rows, identifying genes associated with the transcriptional-state clusters. Rows can recur across clusters and are not 10,022 independent biological discoveries. The markers support descriptions of state-specific expression programs, not immune-cell annotation.
+
+# Cell-cycle state
+
+```{r cycle}
+s_present <- intersect(cc.genes.updated.2019$s.genes,rownames(obj))
+g2m_present <- intersect(cc.genes.updated.2019$g2m.genes,rownames(obj))
+
+if(length(s_present)>=10 && length(g2m_present)>=10) {
+ obj <- CellCycleScoring(obj,s.features=s_present,g2m.features=g2m_present)
+ DimPlot(obj,reduction="umap",group.by="Phase") + ggtitle("Cell-cycle state")
+}
+```
+
+### Interpretation
+
+Cell-cycle scores assign 2,041 G1, 4,726 G2M, and 5,233 S cells. The phase overlay shows spatial enrichment across parts of UMAP, consistent with cell cycle contributing to state structure. The phases are inferred from expression and do not explain every cluster boundary.
+
+# Save
+
+```{r save}
+saveRDS(obj,"data/processed/02_k562_clustered_seurat.rds")
+write.csv(cluster_markers,"results/02_cluster_markers.csv",row.names=FALSE)
+write.csv(as.data.frame(table(cluster=obj$seurat_clusters)),"results/02_cluster_sizes.csv",row.names=FALSE)
+```
+
+## Key results
+
+```{r key-results}
+cat("Analysis cells:", ncol(obj), "genes:", nrow(obj), "HVGs:", length(VariableFeatures(obj)), "\n")
+cat("Clusters:", length(unique(obj$seurat_clusters)), "markers:", nrow(cluster_markers), "\n")
+print(table(obj$seurat_clusters))
+if ("Phase" %in% colnames(obj[[]])) print(table(obj$Phase))
+```
+
+- **Feature space:** 3,000 highly variable genes supplied the PCA analysis.
+- **K562 states:** 10 graph-based clusters summarize transcriptional structure, not separate cell types.
+- **Marker associations:** 10,022 positive rows describe cluster-enriched expression, with possible overlap across clusters.
+- **Cell cycle:** 2,041 G1, 4,726 G2M, and 5,233 S assignments contribute to the observed state pattern.

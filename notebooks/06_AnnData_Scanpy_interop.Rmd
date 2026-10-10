@@ -1,0 +1,121 @@
+---
+title: "06 — Seurat and AnnData interoperability"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=6)
+```
+
+# Export scope
+
+The exported object is the focused Part 2 K562 cohort used for perturbation analysis and classification. It is distinct from the broad Part 1 coverage subset. The export maps normalized expression to `X`, raw counts to the `counts` layer, and includes perturbation and guide metadata plus PCA scores. This focused object has no UMAP reduction, so no `X_umap` embedding is exported.
+
+```{r packages}
+library(Seurat)
+library(anndataR)
+obj <- readRDS("data/processed/03_k562_perturbation_ready.rds")
+stopifnot("gene" %in% colnames(obj[[]]), "sgID_AB" %in% colnames(obj[[]]), "pca" %in% names(obj@reductions))
+cat("Seurat cells x genes:", ncol(obj), "x", nrow(obj), "\n")
+```
+
+# Write and read H5AD
+
+```{r export}
+dir.create("artifacts", showWarnings=FALSE)
+out_h5ad <- "artifacts/06_k562_focused_analysis.h5ad"
+write_h5ad(obj, out_h5ad, mode="w", assay_name="RNA", x_mapping="data",
+           layers_mapping=c(counts="counts"), obs_mapping=TRUE,
+           obsm_mapping=list(X_pca="pca"))
+cat("Export bytes:", file.info(out_h5ad)$size, "\n")
+```
+
+```{r roundtrip-r}
+check <- read_h5ad(out_h5ad)
+stopifnot(nrow(check$obs)==ncol(obj), nrow(check$var)==nrow(obj))
+stopifnot(all(c("gene", "sgID_AB") %in% colnames(check$obs)))
+cat("AnnData cells x genes:", paste(dim(check), collapse=" x "), "\n")
+cat("Metadata columns:", paste(colnames(check$obs), collapse=", "), "\n")
+cat("Embeddings:", paste(names(check$obsm), collapse=", "), "\n")
+```
+
+### Interpretation
+
+The R round-trip recovers 3,458 cells, 8,563 genes, perturbation and guide columns, and the PCA embedding. Matching dimensions and metadata support the integrity of the Seurat-to-H5AD export, while deeper numerical equivalence of every assay layer was not tested here.
+
+# Python AnnData and optional Scanpy check
+
+```{r python-config}
+reticulate::use_python("C:/Python314/python.exe", required=TRUE)
+```
+
+```{python python-check}
+import anndata as ad
+import importlib.util
+import numpy as np
+obj_py = ad.read_h5ad("artifacts/06_k562_focused_analysis.h5ad")
+source_py = ad.read_h5ad("data/processed/03_k562_powered_sample.h5ad")
+assert obj_py.shape == (3458, 8563)
+assert {"gene", "sgID_AB"}.issubset(obj_py.obs.columns)
+assert "X_pca" in obj_py.obsm
+assert obj_py.obsm["X_pca"].shape[0] == obj_py.n_obs
+assert obj_py.obs["gene"].astype(str).nunique() == 13
+assert obj_py.obs_names.equals(source_py.obs_names)
+assert (obj_py.obs["gene"].astype(str) == source_py.obs["gene"].astype(str)).all()
+assert "counts" in obj_py.layers
+assert (obj_py.layers["counts"] != source_py.X).nnz == 0
+assert source_py.var_names.str.replace("_", "-").equals(obj_py.var_names)
+renamed_genes = int((source_py.var_names != obj_py.var_names).sum())
+print("AnnData:", obj_py.shape, "PCA:", obj_py.obsm["X_pca"].shape)
+print("Perturbation classes:", obj_py.obs["gene"].astype(str).nunique())
+print("Counts layer matches source; gene names sanitized by Seurat:", renamed_genes)
+if importlib.util.find_spec("scanpy"):
+    import scanpy as sc
+    scanpy_obj = sc.read_h5ad("artifacts/06_k562_focused_analysis.h5ad")
+    assert scanpy_obj.shape == obj_py.shape
+    assert "X_pca" in scanpy_obj.obsm
+    print("Scanpy read verified:", sc.__version__)
+else:
+    print("Scanpy is not installed; Python AnnData reading and PCA/metadata checks passed.")
+```
+
+### Reproducibility note
+
+Python AnnData reads the H5AD and confirms 13 perturbation classes, PCA coordinates, and a counts layer matching the focused source matrix. Seurat changes underscores to hyphens in two duplicate gene names during import; their column positions and counts remain aligned. Scanpy was unavailable in this environment, so Scanpy-specific reading and visualization compatibility were not directly tested.
+
+# Reproducibility manifest
+
+```{r manifest}
+paths <- c(list.files("notebooks", pattern="^0[1-6]_.*\\.(Rmd|html)$", full.names=TRUE),
+           list.files("results", pattern="\\.csv$", full.names=TRUE),
+           list.files("models", pattern="\\.joblib$", full.names=TRUE),
+           "data/processed/03_k562_powered_sample.h5ad",
+           "data/processed/03_k562_perturbation_ready.rds",
+           "data/processed/03_perturbation_effect_matrix.rds",
+           "data/processed/04_perturbation_embeddings.rds", out_h5ad)
+paths <- unique(paths[file.exists(paths)])
+paths <- paths[paths != "notebooks/06_AnnData_Scanpy_interop.html"]
+manifest <- data.frame(path=paths, bytes=file.info(paths)$size,
+                       md5=unname(tools::md5sum(paths)))
+write.csv(manifest, "artifacts/manifest.csv", row.names=FALSE)
+capture.output(sessionInfo(), file="artifacts/sessionInfo.txt")
+print(manifest[, c("path", "bytes")], row.names=FALSE)
+```
+
+### Reproducibility note
+
+The manifest records paths, sizes, and MD5 hashes for selected outputs; `sessionInfo.txt` records the R package environment. The export H5AD and large processed objects remain local, while these records support review of the executed workflow.
+
+## Key results
+
+```{r key-results}
+cat("Exported cells:", ncol(obj), "genes:", nrow(obj), "classes:", length(unique(as.character(obj$gene))), "\n")
+cat("Manifest entries:", nrow(manifest), "\n")
+```
+
+- **Export:** the focused object contains 3,458 cells, 8,563 genes, and 13 perturbation classes in H5AD.
+- **Round-trip:** R and Python AnnData checks recover the dimensions, labels, and PCA coordinates.
+- **Reproducibility:** 41 manifest entries and R session information identify selected outputs and the execution environment.

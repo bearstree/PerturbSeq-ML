@@ -1,0 +1,7 @@
+metric,value
+accuracy,0.41040462427745666
+macro_f1,0.3856368215566513
+majority_baseline_accuracy,0.1430635838150289
+train_cells,2766.0
+test_cells,692.0
+classes,13.0
